@@ -1,0 +1,595 @@
+---
+title: "BU425Project"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-12-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = getwd())
+```
+
+## EDA
+
+```{r}
+#Load the dataset
+df <- read.csv("accepted_sample.csv")
+head(df)
+```
+```{r}
+unique(df$loan_status)
+```
+We only want to know if the person receiving the loan will default or not. Therefore no valuable insights can be made from "Current" and "" seems like a data error. "Default" and "Charged off" would be considered a 1 as the person did not pay off the loan. "Late" and "In Grace Period" could be useful for analyzes, one model should use data not including records with those instances and one model with those instances labelled as default, as they are at a higher risk of defaulting. "Does not meet the credit policy. Status:Fully Paid" and "fully paid" will be accounted for as non-defaulted loans.
+
+
+```{r}
+#data for scenario 1
+data1 <- df[df$loan_status %in% c("Fully Paid", "Does not meet the credit policy. Status:Fully Paid",
+              "Does not meet the credit policy. Status:Charged Off", "Default", "Charged Off"),]
+data2 <- df[df$loan_status %in% c("Fully Paid", "Does not meet the credit policy. Status:Fully Paid",
+              "Does not meet the credit policy. Status:Charged Off", "Default","Charged Off", "Late (31-120 days)",
+              "Late (16-30 days)", "In Grace Period"),]
+```
+
+The number of records increases by only 3000 when going from data1 to data2
+
+```{r}
+library(dplyr)
+data1 <- data1 %>% 
+  mutate(target = case_when(
+    loan_status %in%  c("Fully Paid", "Does not meet the credit policy. Status:Fully Paid") ~ 0,
+    TRUE ~ 1
+  ))
+data2 <- data2 %>% 
+  mutate(target = case_when(
+    loan_status %in%  c("Fully Paid", "Does not meet the credit policy. Status:Fully Paid") ~ 0,
+    TRUE ~ 1
+  ))
+```
+
+```{r}
+hist(data1$target)
+hist(data2$target)
+```
+Class imbalance less loans default. will use class weighting to mitgate the imbalanced of the data.
+
+```{r}
+colSums(is.na(data2))
+```
+There are several variables that have over 50% of records missing, those variables will be removed from the data set as imputation becomes unreliable.
+
+Other variables that have missing values will be filled in with imputation methods.
+
+```{r}
+#removing columns with over 50% of values missing
+missing_percentage1 <- sapply(data1, function(x) mean(is.na(x)))
+cols_to_remove1 <- names(missing_percentage1[missing_percentage1 > 0.5])
+data1_cleaned <- data1[, !(names(data1) %in% cols_to_remove1)]
+
+missing_percentage2 <- sapply(data2, function(x) mean(is.na(x)))
+cols_to_remove2 <- names(missing_percentage2[missing_percentage2 > 0.5])
+data2_cleaned <- data2[, !(names(data2) %in% cols_to_remove2)]
+```
+
+```{r}
+#checking if any of the columns with missing values have above 20% of values missing
+names(data1_cleaned[sapply(data1_cleaned, function(x) mean(is.na(x))) > 0.2])
+```
+The general rule for imputating data is to use imputation methods like KNN or lasso regression if above 20% of values are missing. The reason for this is that using single value imputation mean or median imputation when over 20% of records are missing distorts the datas statistical properties and distribution. However, since none of the remaining columns with missing values have over 20% of records missing we can use median imputation. In general the median is a better metric than the mean because it does not account for outliers
+
+```{r}
+#Median imputation
+data1_cleaned <- data1_cleaned %>% mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+data2_cleaned <- data2_cleaned %>% mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+#just to be safe
+sum(is.na(data1_cleaned))
+sum(is.na(data2_cleaned))
+```
+To remove potential data leakage only variables that are not post-outcome will be included. Because we want to predict whether a loan will default or not before the loan begins only the variables relevant to that will be included. We will include a rough list so far and then perform feature selection to reduce complexity in our models by only including relevant features
+
+```{r}
+data1_cleaned_subset <- data1_cleaned[, c("loan_amnt", "funded_amnt", "funded_amnt_inv",
+    "int_rate", "installment", "annual_inc", "dti",
+    "delinq_2yrs", "inq_last_6mths", "open_acc",
+    "pub_rec", "revol_bal", "revol_util", "total_acc", "purpose", "home_ownership",
+    "verification_status", "application_type", "target")]
+
+data2_cleaned_subset <- data2_cleaned[, c("loan_amnt", "funded_amnt", "funded_amnt_inv",
+    "int_rate", "installment", "annual_inc", "dti",
+    "delinq_2yrs", "inq_last_6mths", "open_acc",
+    "pub_rec", "revol_bal", "revol_util", "total_acc", "purpose", "home_ownership",
+    "verification_status", "application_type", "target")]
+```
+
+Finding the correlation matrix of the numeric predictors we can see if theres any correlation between predictors, Multicollinearity makes the model unstable resulting in high standard errors and unreliable coefficients
+
+```{r}
+#only include numeric columns in correlation matrix
+cor_matrix1 <- cor(data1_cleaned_subset[, c(1:14)])
+library(corrplot)
+corrplot(cor_matrix1, method = "circle")
+
+cor_matrix2 <- cor(data2_cleaned_subset[, c(1:14)])
+library(corrplot)
+corrplot(cor_matrix2, method = "circle")
+```
+It seems like loan amount, funded amount, funded amount investment and installment are all highly correlated, only one shall be included in the model if any. Open account and total account are also highly correlated, only one shall be included in the model, if any. 
+
+We can plot distribution plots of all the numeric plots to see what distributions of the binary levels differ the most indicating that they would be good features to include in the model and we can also find any outliers. Density plots are good because they show the density ignoring the class imbalance 
+
+```{r}
+library(ggplot2)
+
+num_cols <- data1_cleaned_subset %>% select(where(is.numeric)) %>% 
+  select(-target) %>% 
+  names()
+
+for (col in num_cols){
+  p <- ggplot(data1_cleaned_subset, aes(x = .data[[col]], fill = factor(target))) +
+    geom_density(alpha = 0.4) +
+    labs(
+      title = paste("Density of", col, "by Target Class"),
+      fill = "Target"
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+Seems like loan amount, funded amount and funded amount investment are all identical and good indicators if a loan will default. Some of the distributions are really skewed, outliers may need to be removed or data may need to be standardized.
+
+```{r}
+num_cols <- data2_cleaned_subset %>% select(where(is.numeric)) %>% 
+  select(-target) %>% 
+  names()
+
+for (col in num_cols){
+  p <- ggplot(data2_cleaned_subset, aes(x = .data[[col]], fill = factor(target))) +
+    geom_density(alpha = 0.4) +
+    labs(
+      title = paste("Density of", col, "by Target Class"),
+      fill = "Target"
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+Since the 2 different datasets produce identical distributions, we likely wont get any significant difference from comparing the results of the models, therefore only data2 will be used in the analysis since it contains more records 
+
+Since the distributions for loan amount, funded amount and funded amount investments are all identical only one is need in the distribution, therefore loan amount will be kept as it seems more practical to our problem. The same goes for open account and total account they have the same distributions as well, only total account will be used for our analyses
+
+```{r}
+data2_cleaned_subset <- data2_cleaned_subset[, c("loan_amnt",
+    "int_rate", "installment", "annual_inc", "dti",
+    "delinq_2yrs", "inq_last_6mths",
+    "pub_rec", "revol_bal", "revol_util", "total_acc", "purpose", "home_ownership",
+    "verification_status", "application_type", "target")]
+```
+
+We can see what categorical columns are good indicators for our models using bar plots
+
+```{r}
+df_purp <- data2_cleaned_subset %>%
+  group_by(purpose) %>%
+  summarise(
+    freq_target1 = mean(target == 1)
+  )
+
+ggplot(data = df_purp, aes(x = purpose, y = freq_target1))+
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle=45, hjust=1))+
+  labs(title = "frequency of loan defaults in purpose")
+
+df_home <- data2_cleaned_subset %>%
+  group_by(home_ownership) %>%
+  summarise(
+    freq_target1 = mean(target == 1)
+  )
+
+ggplot(data = df_home, aes(x = home_ownership, y = freq_target1))+
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle=45, hjust=1))+
+  labs(title = "frequency of loan defaults in home improvements")
+
+df_verif <- data2_cleaned_subset %>%
+  group_by(verification_status) %>%
+  summarise(
+    freq_target1 = mean(target == 1)
+  )
+
+ggplot(data = df_verif, aes(x = verification_status, y = freq_target1))+
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle=45, hjust=1))+
+  labs(title = "frequency of loan defaults in verification_status")
+
+
+df_app <- data2_cleaned_subset %>%
+  group_by(application_type) %>%
+  summarise(
+    freq_target1 = mean(target == 1)
+  )
+
+ggplot(data = df_app, aes(x = application_type, y = freq_target1))+
+  geom_bar(stat = "identity")+
+  theme(axis.text.x = element_text(angle=45, hjust=1))+
+  labs(title = "frequency of loan defaults in application_type")
+
+```
+It seems like all of them are good predictors for loan default as the frequency of loan defaults has some level of significance difference for categories. For predictors with lots of categories such as purpose in logistic regression only a few binary categories will be needed 
+
+
+## data preprocessing for random forest
+
+Random forest are robust for outliers and scales being different so that wont be done until logistic regression 
+
+train test split
+
+```{r}
+set.seed(123)
+train_indices <- sample(nrow(data2_cleaned_subset), nrow(data2_cleaned_subset)*0.7)
+train_set <- data2_cleaned_subset[train_indices, ]
+test_set <- data2_cleaned_subset[-train_indices, ] 
+```
+
+Ensuring a lucky split did not happen
+```{r}
+hist(train_set$target)
+hist(test_set$target)
+```
+Split was even for the target variable!
+
+# Random Forest
+
+Random forest using cross validation and class weights to determine optimal hyperparameters
+
+```{r}
+library(caret)
+library(randomForest)
+```
+class weights
+
+```{r}
+tab <- table(train_set$target)
+tab
+w <- ifelse(train_set$target == "1",
+            1/66605,
+            1/18913)
+```
+
+
+Typically for classification random forest the optimal number of parameters per tree is the square root of the number of predictors, therefore 2, 4 and 6 predictors for each tree will be explored
+
+Generally in random forest if a tree overfits it's not as big of deal as in a single decision tree therefore low number of minimum records in a leaf node can be pretty low, we will try 1, 10 and 50 because theres 85518 rows in our data or 57012 when doing cross validation 
+
+```{r}
+tuneGrid <- expand.grid(
+  mtry = c(2, 4, 6),
+  splitrule = "gini",
+  min.node.size = c(1, 10, 50)
+)
+```
+
+```{r}
+trControl <- trainControl(
+  method = "cv", 
+  number = 3,    # 3 folds to make it run faster
+  verboseIter = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary 
+)
+```
+
+```{r}
+train_set$target <- factor(make.names(train_set$target))
+rf_model <- train(
+  target ~ ., 
+  data = train_set,
+  method = "ranger", 
+  metric = "Precision", 
+  tuneGrid = tuneGrid,
+  trControl = trControl,
+  importance = "impurity",
+  weights = w
+)
+```
+
+```{r}
+rf_model$results
+```
+
+```{r}
+plot(rf_model)
+```
+
+Through cross validation it was found that trees with 4 predictors and minimum 50 points at the root nodes is the optimal choice for the random forest of 500 trees
+
+# Logistic regression CV for hyperparameter tuning 
+
+Preprocessing steps for logistic regression can be done in the pipeline for cross validation
+
+To mitigate the effects of skewness outlined in some of the numerical predictors in EDA, scaling the predictors should be done.
+
+```{r}
+preprocess <- c("center", "scale")
+```
+
+
+Class weights
+
+```{r}
+tab <- table(train_set$target)
+tab
+w <- ifelse(train_set$target == "1",
+            1/66605,
+            1/18913)
+```
+
+
+
+```{r}
+trControl <- trainControl(
+  method = "cv",
+  number = 5, # LR is less computationally extensive than random forest of 500 trees so we can afford to do 5 folds              
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+```
+
+Because there is 15 predictors in the data, feature selection through regularization terms should be done. The regularization term used should be determined through cross validation (lass0, elastic net or ridge)
+
+The strength of the penalty term should also be determined through cross validation
+
+```{r}
+tuneGrid <- expand.grid(
+  alpha = c(1, 0.5, 0),             
+  lambda = 10^seq(-4*10, 1, length = 10)   
+)
+```
+
+```{r}
+library(glmnet)
+
+lr_model <- train(
+  target ~ .,
+  data = train_set,
+  method = "glmnet",
+  trControl = trControl,
+  tuneGrid = tuneGrid,
+  metric = "ROC",
+  preProcess = preprocess,
+  weights = w
+)
+```
+
+```{r}
+lr_model$results
+```
+
+Results are constant until the penalty term is above 1, lets expand the search
+
+
+```{r}
+tuneGrid <- expand.grid(
+  alpha = c(1, 0.5, 0),             
+  lambda = 10^seq(-8*10, -1*10, length = 30)  # we can increase the number of penalty terms since this cross validation is MUCH FASTER 
+)
+```
+
+```{r}
+lr_model <- train(
+  target ~ .,
+  data = train_set,
+  method = "glmnet",
+  trControl = trControl,
+  tuneGrid = tuneGrid,
+  metric = "ROC",
+  preProcess = preprocess,
+  weights = w
+)
+```
+
+```{r}
+lr_model$results
+plot(lr_model)
+```
+
+The lines are just straight meaning they make the exact same predictions, lets expand the grid to cover more ground 
+
+```{r}
+tuneGrid <- expand.grid(
+  alpha = c(1, 0.5, 0),             
+  lambda = 10^seq(-15*10, 1*10, length = 100)  # we can increase the number of penalty terms since this cross validation is MUCH FASTER 
+)
+```
+
+```{r}
+lr_model <- train(
+  target ~ .,
+  data = train_set,
+  method = "glmnet",
+  trControl = trControl,
+  tuneGrid = tuneGrid,
+  metric = "ROC",
+  preProcess = preprocess,
+  weights = w
+)
+```
+
+```{r}
+lr_model$results
+plot(lr_model)
+```
+Seems like ridge regression at a penalty less than 2.848036e-05 is the optimal choice for the logistic regression model. Typically in practice the less complex model the better so the strong the penalty should be, therefore the penalty 2.848036e-05 will be used for ridge regression 
+
+Lets try narrowing the search just a little to strength our optimal lambda 
+
+```{r}
+tuneGrid <- expand.grid(
+  alpha = c(1, 0.5, 0),             
+  lambda = 10^seq(-2*10, 0*10, length = 100)  # we can increase the number of penalty terms since this cross validation is MUCH FASTER 
+)
+```
+
+
+```{r}
+lr_model <- train(
+  target ~ .,
+  data = train_set,
+  method = "glmnet",
+  trControl = trControl,
+  tuneGrid = tuneGrid,
+  metric = "ROC",
+  preProcess = preprocess,
+  weights = w
+)
+```
+
+```{r}
+lr_model$results
+plot(lr_model)
+```
+
+#random forest
+
+
+
+# Logistic Regression Model Evaluation
+
+First we will training both models on the full training set with the optimal hyperparameters 
+
+```{r}
+test_set$target  <- factor(test_set$target,  levels = c(0,1), labels = c("X0", "X1"))
+```
+
+
+```{r}
+lr_prob <- predict(lr_model, newdata = test_set, type = "prob")[, "X1"]
+```
+
+```{r}
+lr_class <- ifelse(lr_prob > 0.5, "X1", "X0")
+lr_class <- factor(lr_class, levels = c("X1", "X0"))
+
+confusionMatrix(
+  lr_class,
+  factor(test_set$target, levels = c("X1", "X0")),
+  mode = "everything"
+)
+```
+The classifcation for loan default is horrible (sensitivity 0.08982) even when accounting for class weights and using regularization, maybe changing the treshold will change things?
+
+```{r}
+library(pROC)
+roc_obj <- roc(response = test_set$target, predictor = lr_prob)
+auc(roc_obj)
+plot(roc_obj)
+coords(roc_obj, "best", "threshold")
+```
+Lets try it with this new threshold!
+
+```{r}
+lr_class <- ifelse(lr_prob > 0.2131736, "X1", "X0")
+lr_class <- factor(lr_class, levels = c("X1", "X0"))
+
+confusionMatrix(
+  lr_class,
+  factor(test_set$target, levels = c("X1", "X0")),
+  mode = "everything"
+)
+```
+The overall accuracy goes down but the thing we care about the most is that we classify more loans that will default correctly and this threshold does!!!
+
+The new sensitivity is 0.6574 not great but better
+
+Obviously a very low threshold would indicate that all loans will default, so even though we can maximize specificity through making the threshold very low, its not practical for our problem
+
+
+```{r}
+varImp(lr_model)
+plot(varImp(lr_model))
+```
+It looks like loan amount has the highest importance followd by interest rate and installment
+
+lets see the direction of the coefficents 
+
+```{r}
+final_glm <- lr_model$finalModel
+coefs <- as.matrix(
+  coef(final_glm, s = final_glm$lambdaOpt)
+)
+coefs
+```
+We can see the direction and magnitude of the coefficents the positive ones mean higher values of that variable are more likely to loan default and negative ones mean that the lower values of that variable are more likely to loan default
+
+#Evaluating Random Forest
+
+```{r}
+rf_prob_preds <- predict(rf_model, newdata = test_set, type = "prob")
+```
+
+```{r}
+rf_class <- ifelse(rf_prob_preds$X1 > 0.5, "X1", "X0")
+rf_class <- factor(rf_class, levels = c("X1", "X0"))
+
+confusionMatrix(
+  rf_class,
+  factor(test_set$target, levels = c("X1", "X0")),
+  mode = "everything"
+)
+```
+This threshold is very bad even with class weighting it heavility favours the majority class. Lets see if changing the threshold will do better
+
+```{r}
+roc_obj <- roc(response = test_set$target, predictor = rf_prob_preds$X1)
+auc(roc_obj)
+plot(roc_obj)
+coords(roc_obj, x = "best", input = "specificity")
+```
+
+```{r}
+rf_class <- ifelse(rf_prob_preds$X1 > 0.2159543	, "X1", "X0")
+rf_class <- factor(rf_class, levels = c("X1", "X0"))
+
+confusionMatrix(
+  rf_class,
+  factor(test_set$target, levels = c("X1", "X0")),
+  mode = "everything"
+)
+```
+Much better sensetivity. F1 score is still pretty low 
+
+Lets see the feature importance
+
+```{r}
+varImp(rf_model)
+```
+
+```{r}
+plot(varImp(rf_model))
+```
+Loan amount has less importance in this model and it seems like interest rate has the most importance 
+
+Determining the direction of the predictors (+1 means higher values are more likely to be loan default, -1 means lower values are more likely to loan default)
+
+```{r}
+positive_class <- "X1"
+
+direction_df <- sapply(names(train_set)[names(train_set) != "target"], function(f) {
+  mean_pos <- mean(train_set[train_set$target == positive_class, f], na.rm = TRUE)
+  mean_neg <- mean(train_set[train_set$target != positive_class, f], na.rm = TRUE)
+  
+  sign(mean_pos - mean_neg)
+})
+
+direction_df
+
+```
+
+Random forest performs slightly better, you can use the model interpretations (importance and direction) to make predictions 
