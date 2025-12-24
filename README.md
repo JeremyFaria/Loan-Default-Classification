@@ -1,0 +1,1 @@
+My group members and I found covariates strongly associated with a loan defaulting. A random forest and logistic regression was done to find the most important features leading to a loan defaulting. The data was too big to include in the repoistory but it can be found here: https://www.kaggle.com/datasets/wordsforthewise/lending-club/data
